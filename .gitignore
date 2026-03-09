@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+.env
+
+# Node / Next
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Optional: uncomment to avoid committing the large JSON (use NEXT_PUBLIC_DATA_URL instead)
+# dashboard/public/data/result.json
