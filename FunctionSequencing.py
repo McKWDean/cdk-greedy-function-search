@@ -11,7 +11,7 @@ Option A — Two Excel files
       ENTERPRISE ID   — unique ID per customer
       NAME            — display name for the customer
       FUNCTION        — function name (e.g. "Payroll", "Inventory")
-      USAGE_PATTERN   — "1 - daily" | "2 - weekly" | "3 - monthly" (others ignored)
+      USAGE_PATTERN   — "1 - daily" | "2 - weekly" | "3 - monthly" (or "daily", "weekly", "monthly"; others normalized or ignored)
     COMPLETED is taken from WorkflowMapping (see below). Functions not listed in WorkflowMapping are out of scope.
     Multiple rows per (ENTERPRISE ID, FUNCTION) are allowed; all must be "Yes"
     (or "Partial" if treat_partial_as_done) for that pair to count as done.
@@ -38,6 +38,7 @@ For .xlsx files, openpyxl is required: pip install pandas openpyxl
 
 import argparse
 import json
+from collections import deque
 from pathlib import Path
 
 import pandas as pd
@@ -70,6 +71,15 @@ def get_excel_sheet_names(path: Path) -> List[str]:
     if path.suffix.lower() in (".xlsx", ".xlsm"):
         return pd.ExcelFile(path, engine="openpyxl").sheet_names
     return pd.ExcelFile(path).sheet_names
+
+
+def read_all_excel_sheets(path: Path) -> Dict[str, pd.DataFrame]:
+    """Read all sheets from an Excel file in one pass. Returns dict sheet_name -> DataFrame."""
+    path = Path(path)
+    kwargs = {"sheet_name": None}
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        kwargs["engine"] = "openpyxl"
+    return pd.read_excel(path, **kwargs)
 
 
 REQUIRED_FUNCTION_COLS = ("ENTERPRISE ID", "NAME", "FUNCTION", "USAGE_PATTERN")
@@ -217,8 +227,13 @@ def greedy_unlock_functions_with_arr_outputs(
     treat_partial_as_done: bool = False,
     objective: str = "customers",  # "customers" | "arr" | "blend" | "rooftops"
     blend_weight_customers: float = 0.5,  # for "blend": weight on customers (1 - this = weight on ARR)
+    _prepared_arr: Optional[Tuple[Set, Dict, Optional[Dict]]] = None,  # (eligible, arr_map, rooftops_map) to skip recomputation
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], Set[str]]:
     """
+    In-scope = functions not yet modernized (Complete is No or Partial) and used by ≥1 customer
+    at this scope's frequency (daily/weekly or daily/weekly/monthly). Greedy picks optimal order
+    to maximize rooftops (or chosen objective) unlocked.
+
     Same greedy algorithm, but returns TWO outputs shaped exactly as requested:
 
     Output 1 (steps_df):
@@ -250,9 +265,12 @@ def greedy_unlock_functions_with_arr_outputs(
         objective = "arr"
 
     # ---- 0) ARR eligibility + mapping collapsed to (ent, func) with is_done ----
-    _, eligible_enterprises, arr_map, rooftops_map = _prepare_enterprise_arr(
-        enterprise_arr, arr_threshold, enterprise_col, arr_col
-    )
+    if _prepared_arr is not None:
+        eligible_enterprises, arr_map, rooftops_map = _prepared_arr
+    else:
+        _, eligible_enterprises, arr_map, rooftops_map = _prepare_enterprise_arr(
+            enterprise_arr, arr_threshold, enterprise_col, arr_col
+        )
     ef, name_map = _prepare_mapping_ef(
         df, eligible_enterprises, valid_patterns, treat_partial_as_done,
         enterprise_col, name_col, function_col, completed_col, usage_col,
@@ -275,7 +293,9 @@ def greedy_unlock_functions_with_arr_outputs(
         .apply(lambda s: s.unique().tolist())
         .to_dict()
     )
+    # In-scope = not yet modernized (Complete is No or Partial) and used by ≥1 customer at this scope's frequency
     candidate_functions = set(ents_by_func.keys())
+    k = max(k, len(candidate_functions))
 
     # ---- 3) Greedy selection with progress scoring ----
     selected_functions: List[str] = []
@@ -328,6 +348,7 @@ def greedy_unlock_functions_with_arr_outputs(
         use_blend = objective == "blend"
         candidate_scores_customers: Dict[str, float] = {}
         candidate_scores_arr: Dict[str, float] = {}
+        max_c, max_a = 0.0, 0.0
 
         for f in candidate_functions:
             customer_score = 0.0
@@ -347,6 +368,10 @@ def greedy_unlock_functions_with_arr_outputs(
             if use_blend:
                 candidate_scores_customers[f] = customer_score
                 candidate_scores_arr[f] = arr_score
+                if customer_score > max_c:
+                    max_c = customer_score
+                if arr_score > max_a:
+                    max_a = arr_score
             else:
                 if objective == "arr":
                     score = arr_score
@@ -359,8 +384,8 @@ def greedy_unlock_functions_with_arr_outputs(
                     best_f = f
 
         if use_blend and candidate_scores_customers:
-            max_c = max(candidate_scores_customers.values()) or 1.0
-            max_a = max(candidate_scores_arr.values()) or 1.0
+            max_c = max_c or 1.0
+            max_a = max_a or 1.0
             for f in candidate_functions:
                 nc = candidate_scores_customers.get(f, 0.0) / max_c
                 na = candidate_scores_arr.get(f, 0.0) / max_a
@@ -439,6 +464,99 @@ def _dataframe_to_json_records(df: pd.DataFrame) -> list:
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
+def _build_workflow_map_least_functions(df_workflow: pd.DataFrame) -> Dict[str, str]:
+    """
+    When a function appears in multiple workflows, pick the workflow that has the least
+    total functions mapped to it (to spread functions across workflows).
+    Returns dict: function_upper -> workflow name.
+    """
+    if df_workflow is None or df_workflow.empty or "WORKFLOW" not in df_workflow.columns or "FUNCTION" not in df_workflow.columns:
+        return {}
+    df = df_workflow[["WORKFLOW", "FUNCTION"]].dropna().copy()
+    df["FUNCTION"] = df["FUNCTION"].astype(str).str.strip()
+    df["WORKFLOW"] = df["WORKFLOW"].astype(str).str.strip()
+    # Count distinct functions per workflow (each workflow may have many rows for same function)
+    workflow_function_count = df.drop_duplicates(subset=["WORKFLOW", "FUNCTION"]).groupby("WORKFLOW").size()
+    workflow_count_map = workflow_function_count.to_dict()
+    out: Dict[str, str] = {}
+    for func, grp in df.groupby("FUNCTION"):
+        workflows = grp["WORKFLOW"].unique().tolist()
+        if not workflows:
+            continue
+        best_wf = min(workflows, key=lambda w: workflow_count_map.get(w, 0))
+        out[func.upper()] = best_wf
+    return out
+
+
+def _reorder_sequence_with_workflow_pullup(
+    ordered_functions: List[str],
+    workflow_map: Dict[str, str],
+    threshold: int = 3,
+) -> List[str]:
+    """
+    If a function has fewer than `threshold` other same-workflow functions later in the
+    sequence, pull those up to be immediately after it. Modifies only the order.
+    """
+    if not ordered_functions or threshold <= 0:
+        return list(ordered_functions)
+    remaining = deque(ordered_functions)
+    new_order: List[str] = []
+    while remaining:
+        f = remaining.popleft()
+        f_upper = str(f).strip().upper() if f else ""
+        w = workflow_map.get(f_upper, "")
+        trailing = [x for x in remaining if workflow_map.get(str(x).strip().upper() if x else "", "") == w]
+        if 1 <= len(trailing) < threshold:
+            new_order.append(f)
+            new_order.extend(trailing)
+            trailing_set = set(trailing)
+            remaining = deque(x for x in remaining if x not in trailing_set)
+        else:
+            new_order.append(f)
+    return new_order
+
+
+def _rebuild_steps_and_unlock_from_order(
+    new_order: List[str],
+    steps_df: pd.DataFrame,
+    enterprise_unlock_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Rebuild steps_df and enterprise_unlock_df with new step numbers from reordered function list."""
+    if not new_order or steps_df.empty or enterprise_unlock_df.empty:
+        return steps_df, enterprise_unlock_df
+    new_step_for_function = {str(f).strip(): i + 1 for i, f in enumerate(new_order) if f and str(f).strip()}
+    # Map old function_to_modernize to new step for each enterprise row (preserve original step if not in new order)
+    eu = enterprise_unlock_df.copy()
+    eu["_func_key"] = eu["function_to_modernize"].astype(str).str.strip()
+    eu["new_step"] = eu["_func_key"].map(new_step_for_function)
+    eu.loc[eu["new_step"].isna(), "new_step"] = eu.loc[eu["new_step"].isna(), "step"]
+    eu["step"] = eu["new_step"].astype(int)
+    eu = eu.drop(columns=["new_step", "_func_key"], errors="ignore")
+    enterprise_unlock_df_new = eu
+
+    step_0 = steps_df[steps_df["step"] == 0]
+    rows = []
+    for i, f in enumerate(new_order):
+        s = i + 1
+        count = int((eu["step"] == s).sum())
+        rows.append({
+            "step": s,
+            "function_to_modernize": f,
+            "customers_unlocked": count,
+            "cumulative_customers_unlocked": 0,  # fill below
+        })
+    if rows:
+        steps_new = pd.DataFrame(rows)
+        base_cum = int(step_0["cumulative_customers_unlocked"].iloc[0]) if not step_0.empty else 0
+        steps_new["cumulative_customers_unlocked"] = base_cum + steps_new["customers_unlocked"].cumsum()
+        if not step_0.empty:
+            steps_new = pd.concat([step_0, steps_new], ignore_index=True)
+        steps_df_new = steps_new.sort_values("step").reset_index(drop=True)
+    else:
+        steps_df_new = steps_df
+    return steps_df_new, enterprise_unlock_df_new
+
+
 # Dollar columns to round to nearest dollar in outputs
 DOLLAR_COLUMNS = ("total_arr_of_customer", "cumulative_arr_unlocked", "arr_unlocked", "ARR")
 
@@ -464,6 +582,10 @@ DISPLAY_COLUMNS = {
     "functions_not_modernized": "Functions Not Yet Modernized (Daily/Weekly/Monthly)",
     "function_completed_in_step": "Function Completed (Step)",
     "workflow": "Workflow",
+    "segment": "Segment",
+    "Configuration": "Configuration",
+    "Churn Propensity": "Churn Propensity",
+    "Risk Category": "Risk Category",
 }
 
 
@@ -527,6 +649,68 @@ def build_tranche_summary(tranche_df: pd.DataFrame) -> pd.DataFrame:
         "cumulative_arr_unlocked",
     ]]
     return out
+
+
+def build_segment_summary(
+    tranche_summary_df: pd.DataFrame,
+    rooftop_segment_size: int = 1000,
+) -> pd.DataFrame:
+    """
+    Segment = group of functions (steps) to achieve 1000 rooftops unlocked.
+    Segment 0 = entirely modern customers (step 0). Segment k (k>=1) = floor(cumulative_rooftops/1000) + 1.
+    Output: Segment, concatenated functions, count of functions, customers unlocked, rooftops unlocked,
+    total Current DMS ARR, average rooftops per customer, average Current DMS ARR per customer.
+    """
+    if tranche_summary_df is None or tranche_summary_df.empty:
+        return pd.DataFrame()
+    need = {"step", "function_to_modernize", "customers_unlocked", "rooftops_unlocked", "cumulative_rooftops_unlocked", "arr_unlocked"}
+    if not need.issubset(tranche_summary_df.columns):
+        return pd.DataFrame()
+    df = tranche_summary_df[list(need)].copy()
+    # One row per step (take first if duplicate step from any merge)
+    df = df.drop_duplicates(subset=["step"], keep="first")
+    # Segment 0 = step 0 (entirely modern); segment = floor(cumulative_rooftops / 1000) + 1 for step >= 1
+    df["segment"] = np.where(
+        df["step"] == 0,
+        0,
+        (pd.to_numeric(df["cumulative_rooftops_unlocked"], errors="coerce").fillna(0) // rooftop_segment_size).astype(int) + 1,
+    )
+    agg = df.groupby("segment").agg(
+        functions_list=("function_to_modernize", lambda s: " | ".join(str(x).strip() for x in s if str(x).strip())),
+        count_functions=("step", "count"),
+        customers_unlocked=("customers_unlocked", "sum"),
+        rooftops_unlocked=("rooftops_unlocked", "sum"),
+        total_current_dms_arr=("arr_unlocked", "sum"),
+    ).reset_index()
+    agg["average_rooftops_per_customer"] = np.where(
+        agg["customers_unlocked"] > 0,
+        agg["rooftops_unlocked"] / agg["customers_unlocked"],
+        0,
+    )
+    agg["average_current_dms_arr_per_customer"] = np.where(
+        agg["customers_unlocked"] > 0,
+        agg["total_current_dms_arr"] / agg["customers_unlocked"],
+        0,
+    )
+    agg = agg.rename(columns={
+        "segment": "Segment",
+        "functions_list": "Functions (steps in segment)",
+        "count_functions": "Count of functions",
+        "customers_unlocked": "Count of customers unlocked",
+        "rooftops_unlocked": "Count of rooftops unlocked",
+        "total_current_dms_arr": "Total Current DMS ARR",
+        "average_rooftops_per_customer": "Average rooftops per customer",
+        "average_current_dms_arr_per_customer": "Average Current DMS ARR per customer",
+    })
+    # Round dollars and decimals
+    agg["Total Current DMS ARR"] = pd.to_numeric(agg["Total Current DMS ARR"], errors="coerce").fillna(0).round(0).astype(int)
+    agg["Average rooftops per customer"] = agg["Average rooftops per customer"].round(2)
+    agg["Average Current DMS ARR per customer"] = pd.to_numeric(agg["Average Current DMS ARR per customer"], errors="coerce").fillna(0).round(0).astype(int)
+    return agg[
+        ["Segment", "Functions (steps in segment)", "Count of functions", "Count of customers unlocked",
+         "Count of rooftops unlocked", "Total Current DMS ARR", "Average rooftops per customer",
+         "Average Current DMS ARR per customer"]
+    ]
 
 
 def build_enterprise_unlock_view(enterprise_unlock_df: pd.DataFrame) -> pd.DataFrame:
@@ -606,13 +790,137 @@ def build_enterprise_function_usage_matrix(
 
     # Row 1 = column names, Row 2 = workflow, Row 3 = completion status (Yes/No/Partial)
     header_row_1 = ["Enterprise ID", "Name", "Rooftops", "ARR"] + in_scope_functions
-    header_row_2 = ["", "", "", ""] + [workflow_map.get(f, "") for f in in_scope_functions]
-    header_row_3 = ["", "", "", ""] + [completed_map.get(f, "") for f in in_scope_functions] if completed_map else ["", "", "", ""] + [""] * len(in_scope_functions)
+    header_row_2 = ["", "", "", ""] + [workflow_map.get(f.upper(), "") for f in in_scope_functions]
+    header_row_3 = ["", "", "", ""] + [completed_map.get(f.upper(), "") for f in in_scope_functions] if completed_map else ["", "", "", ""] + [""] * len(in_scope_functions)
     all_rows = [header_row_1, header_row_2, header_row_3] + data_rows
     return pd.DataFrame(all_rows)
 
 
+def _normalize_usage_pattern(usage: str) -> str:
+    """Map USAGE_PATTERN to canonical form: 'daily' or '1 - daily' -> '1 - daily', etc."""
+    u = str(usage).strip().lower()
+    if not u:
+        return str(usage).strip()
+    if "daily" in u:
+        return "1 - daily"
+    if "weekly" in u:
+        return "2 - weekly"
+    if "monthly" in u:
+        return "3 - monthly"
+    if "quarterly" in u:
+        return "4 - quarterly"
+    return str(usage).strip()
+
+
+def _normalize_usage_pattern_series(ser: pd.Series) -> pd.Series:
+    """Vectorized: map USAGE_PATTERN column to canonical form."""
+    s = ser.astype(str).str.strip()
+    u = s.str.lower()
+    return pd.Series(
+        np.select(
+            [
+                u.str.contains("daily", na=False),
+                u.str.contains("weekly", na=False),
+                u.str.contains("monthly", na=False),
+                u.str.contains("quarterly", na=False),
+            ],
+            ["1 - daily", "2 - weekly", "3 - monthly", "4 - quarterly"],
+            default=s.values,
+        ),
+        index=ser.index,
+    )
+
+
+def _usage_bucket(usage: str) -> str:
+    """Map USAGE_PATTERN to bucket: daily, weekly, monthly, quarterly, less_than_quarterly."""
+    u = str(usage).strip().lower()
+    if "daily" in u or u == "1 - daily":
+        return "daily"
+    if "weekly" in u or u == "2 - weekly":
+        return "weekly"
+    if "monthly" in u or u == "3 - monthly":
+        return "monthly"
+    if "quarterly" in u or u == "4 - quarterly":
+        return "quarterly"
+    return "less_than_quarterly"
+
+
+def build_function_frequency_summary(
+    df_mapping: pd.DataFrame,
+    workflow_map: Dict[str, str],
+    completed_map: Optional[Dict[str, str]] = None,
+    enterprise_col: str = "ENTERPRISE ID",
+    function_col: str = "FUNCTION",
+    usage_col: str = "USAGE_PATTERN",
+    in_scope_functions: Optional[Set[str]] = None,
+) -> pd.DataFrame:
+    """
+    One row per function: Function, Workflow, Complete, usage % by frequency, Total Customers.
+    Uses raw mapping data (all usage patterns) so you see how often functions are used.
+    Total Customers = unique ENTERPRISE IDs (excl. "0"). Percentages sum to 100% per row.
+    """
+    if df_mapping.empty or function_col not in df_mapping.columns or usage_col not in df_mapping.columns:
+        return pd.DataFrame()
+
+    d = df_mapping[[enterprise_col, function_col, usage_col]].copy()
+    d[enterprise_col] = d[enterprise_col].astype(str).str.strip()
+    d[function_col] = d[function_col].astype(str).str.strip()
+    d[usage_col] = d[usage_col].astype(str).str.strip()
+    d = d.dropna(subset=[enterprise_col, function_col])
+    d = d[d[enterprise_col] != "0"].copy()
+    d = _reduce_to_most_frequent_usage(d, enterprise_col, function_col, usage_col)
+    d["_bucket"] = d[usage_col].map(_usage_bucket)
+    # Normalize to upper for grouping so casing in FunctionMapping matches in_scope_functions from WorkflowMapping
+    d["_func_key"] = d[function_col].str.upper()
+
+    # All functions to report: in-scope set if provided, else unique from data
+    if in_scope_functions is not None:
+        functions = sorted(in_scope_functions)
+    else:
+        functions = sorted(d[function_col].unique().tolist())
+
+    total_per_func = d.groupby("_func_key")[enterprise_col].nunique()
+    bucket_per_func = d.groupby(["_func_key", "_bucket"])[enterprise_col].nunique().unstack(fill_value=0)
+
+    buckets = ["daily", "weekly", "monthly", "quarterly", "less_than_quarterly"]
+    pct_cols = [
+        "% Customers (daily)", "% Customers (weekly)", "% Customers (monthly)",
+        "% Customers (quarterly)", "% Customers (quarterly plus / no pattern)",
+    ]
+    for b in buckets:
+        if b not in bucket_per_func.columns:
+            bucket_per_func[b] = 0
+
+    rows = []
+    for func in functions:
+        key = func.upper()
+        total = int(total_per_func.get(key, 0))
+        row = {
+            "Function": func,
+            "Workflow": workflow_map.get(key, ""),
+            "Complete": completed_map.get(key, "") if completed_map else "",
+            "Total Customers": total,
+        }
+        if total > 0 and key in bucket_per_func.index:
+            for b, col in zip(buckets, pct_cols):
+                row[col] = round(100.0 * bucket_per_func.loc[key, b] / total, 1)
+        else:
+            for col in pct_cols:
+                row[col] = 0
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    out = out[
+        ["Function", "Workflow", "Complete",
+         "% Customers (daily)", "% Customers (weekly)", "% Customers (monthly)",
+         "% Customers (quarterly)", "% Customers (quarterly plus / no pattern)",
+         "Total Customers"]
+    ]
+    return out
+
+
 # Scope definitions for "remaining to modernize" views (by frequency; match input format)
+SCOPE_DAILY = ("1 - daily",)
 SCOPE_DAILY_WEEKLY = ("1 - daily", "2 - weekly")
 SCOPE_DAILY_WEEKLY_MONTHLY = ("1 - daily", "2 - weekly", "3 - monthly")
 
@@ -838,7 +1146,17 @@ def main() -> int:
         default="WorkflowMapping",
         help="Sheet name for WorkflowMapping (WORKFLOW, FUNCTION) when using --input-excel (default: WorkflowMapping).",
     )
-    parser.add_argument("--k", type=int, default=150, help="Max number of functions to select.")
+    parser.add_argument(
+        "--sheet-enterprise-configs",
+        default="EnterpriseConfigs",
+        help="Sheet name for EnterpriseConfigs (ENTERPRISE ID, Configuration) when using --input-excel (default: EnterpriseConfigs).",
+    )
+    parser.add_argument(
+        "--sheet-enterprise-churn",
+        default="EnterpriseChurn",
+        help="Sheet name for EnterpriseChurn (ENTERPRISE ID, Churn Propensity, Risk Category) when using --input-excel (default: EnterpriseChurn).",
+    )
+    parser.add_argument("--k", type=int, default=300, help="Min number of steps to run. Automatically increased to cover all functions that still block at least one customer (so full modernization has one step per such function).")
     parser.add_argument("--arr-threshold", type=float, default=0.0, help="Minimum ARR for customer eligibility.")
     parser.add_argument(
         "--objective",
@@ -864,6 +1182,18 @@ def main() -> int:
         metavar="PATH",
         help="Also write dashboard data to a JSON file (for the Vercel dashboard).",
     )
+    parser.add_argument(
+        "--dashboard-pretty",
+        action="store_true",
+        help="Write dashboard JSON with indentation (larger file, human-readable). Default is compact.",
+    )
+    parser.add_argument(
+        "--dashboard-max-unlock-rows",
+        type=int,
+        metavar="N",
+        default=None,
+        help="Cap 'Enterprise unlock by step' rows per scope in dashboard JSON (reduces file size). Omit for no cap.",
+    )
     args = parser.parse_args()
 
     # Accept input Excel from positional arg, --input-excel, or auto-detect in project folder
@@ -879,12 +1209,14 @@ def main() -> int:
                 print(f"Using input file: {input_excel}")
                 break
 
+    all_sheets: Optional[Dict[str, pd.DataFrame]] = None
     if input_excel is not None:
         path = Path(input_excel)
         if not path.exists():
             parser.error(f"Input Excel file not found: {path}")
-        df_function_mapping = read_excel_sheet(path, args.sheet_function_mapping)
-        df_arr = read_excel_sheet(path, args.sheet_enterprise_arr)
+        all_sheets = read_all_excel_sheets(path)
+        df_function_mapping = all_sheets[args.sheet_function_mapping].copy()
+        df_arr = all_sheets[args.sheet_enterprise_arr].copy()
     elif args.function_mapping and args.enterprise_arr:
         df_function_mapping = _read_excel(Path(args.function_mapping))
         df_arr = _read_excel(Path(args.enterprise_arr))
@@ -900,69 +1232,106 @@ def main() -> int:
     # Load WorkflowMapping early: defines in-scope functions and supplies COMPLETED (and workflow for outputs)
     workflow_map: Dict[str, str] = {}
     completed_map: Dict[str, str] = {}
-    if input_excel is not None:
-        path = Path(input_excel)
-        sheet_names = get_excel_sheet_names(path)
-        if args.sheet_workflow_mapping in sheet_names:
-            df_workflow = read_excel_sheet(path, args.sheet_workflow_mapping)
+    in_scope_functions: Set[str] = set()
+    if all_sheets is not None:
+        if args.sheet_workflow_mapping in all_sheets:
+            df_workflow = all_sheets[args.sheet_workflow_mapping].copy()
             df_workflow = _normalize_columns(df_workflow, ("WORKFLOW", "FUNCTION", "COMPLETED"))
             if "FUNCTION" in df_workflow.columns:
-                # In-scope: only functions listed in WorkflowMapping are considered
+                # In-scope: only functions listed in WorkflowMapping are considered (case-insensitive match)
                 in_scope_functions = set(df_workflow["FUNCTION"].dropna().astype(str).str.strip().unique())
+                in_scope_upper = {f.upper() for f in in_scope_functions}
                 df_function_mapping = df_function_mapping[
-                    df_function_mapping["FUNCTION"].astype(str).str.strip().isin(in_scope_functions)
+                    df_function_mapping["FUNCTION"].astype(str).str.strip().str.upper().isin(in_scope_upper)
                 ].copy()
                 if "WORKFLOW" in df_workflow.columns:
-                    df_wf_unique = df_workflow.drop_duplicates(subset=["FUNCTION"], keep="first")
-                    workflow_map = df_wf_unique.set_index("FUNCTION")["WORKFLOW"].astype(str).str.strip().to_dict()
+                    # Multiple workflows per function: pick the workflow with the least total functions mapped to it
+                    workflow_map = _build_workflow_map_least_functions(df_workflow)
                 if "COMPLETED" in df_workflow.columns:
                     df_wf_c = df_workflow[["FUNCTION", "COMPLETED"]].drop_duplicates(subset=["FUNCTION"], keep="first").copy()
                     df_wf_c["FUNCTION"] = df_wf_c["FUNCTION"].astype(str).str.strip()
-                    completed_map = df_wf_c.set_index("FUNCTION")["COMPLETED"].astype(str).str.strip().to_dict()
+                    df_wf_c["_fk"] = df_wf_c["FUNCTION"].str.upper()
+                    completed_map = df_wf_c.set_index("_fk")["COMPLETED"].astype(str).str.strip().to_dict()
                     df_function_mapping = df_function_mapping.drop(columns=["COMPLETED"], errors="ignore")
+                    # Merge COMPLETED on upper-case key so different casing in FunctionMapping still matches
+                    df_wf_merge = df_workflow[["FUNCTION", "COMPLETED"]].drop_duplicates(subset=["FUNCTION"], keep="first").copy()
+                    df_wf_merge["_fk"] = df_wf_merge["FUNCTION"].astype(str).str.strip().str.upper()
+                    df_function_mapping["_fk"] = df_function_mapping["FUNCTION"].astype(str).str.strip().str.upper()
                     df_function_mapping = df_function_mapping.merge(
-                        df_workflow[["FUNCTION", "COMPLETED"]].drop_duplicates(subset=["FUNCTION"], keep="first"),
-                        on="FUNCTION",
-                        how="left",
-                    )
+                        df_wf_merge[["_fk", "COMPLETED"]], on="_fk", how="left"
+                    ).drop(columns=["_fk"])
+    if not in_scope_functions and "FUNCTION" in df_function_mapping.columns:
+        in_scope_functions = set(df_function_mapping["FUNCTION"].dropna().astype(str).str.strip().unique())
+
+    # Normalize USAGE_PATTERN so "daily", "weekly", etc. are treated as "1 - daily", "2 - weekly", etc.
+    if "USAGE_PATTERN" in df_function_mapping.columns:
+        df_function_mapping["USAGE_PATTERN"] = _normalize_usage_pattern_series(df_function_mapping["USAGE_PATTERN"])
 
     _validate_input_dfs(df_function_mapping, df_arr)
 
     # If a Rooftops sheet exists (single Excel only), merge it into ARR data by ENTERPRISE ID
-    if input_excel is not None:
-        path = Path(input_excel)
-        sheet_names = get_excel_sheet_names(path)
-        if args.sheet_rooftops in sheet_names:
-            df_rooftops = read_excel_sheet(path, args.sheet_rooftops)
-            df_rooftops = _normalize_columns(df_rooftops, ("ENTERPRISE ID", "ROOFTOPS"))
-            if "ENTERPRISE ID" in df_rooftops.columns and "ROOFTOPS" in df_rooftops.columns:
-                df_rooftops = df_rooftops[["ENTERPRISE ID", "ROOFTOPS"]].drop_duplicates(subset=["ENTERPRISE ID"], keep="first")
-                # Ensure df_arr has "ENTERPRISE ID" for merge (in case Excel header didn't normalize)
-                if "ENTERPRISE ID" not in df_arr.columns:
-                    _norm = lambda s: " ".join(str(s).strip().lower().split())
-                    for c in df_arr.columns:
-                        if _norm(c) == "enterprise id":
-                            df_arr = df_arr.rename(columns={c: "ENTERPRISE ID"})
-                            break
-                if "ENTERPRISE ID" in df_arr.columns:
-                    df_arr = df_arr.merge(df_rooftops, on="ENTERPRISE ID", how="left")
+    if all_sheets is not None and args.sheet_rooftops in all_sheets:
+        df_rooftops = _normalize_columns(all_sheets[args.sheet_rooftops].copy(), ("ENTERPRISE ID", "ROOFTOPS"))
+        if "ENTERPRISE ID" in df_rooftops.columns and "ROOFTOPS" in df_rooftops.columns:
+            df_rooftops = df_rooftops[["ENTERPRISE ID", "ROOFTOPS"]].drop_duplicates(subset=["ENTERPRISE ID"], keep="first")
+            if "ENTERPRISE ID" not in df_arr.columns:
+                _norm = lambda s: " ".join(str(s).strip().lower().split())
+                for c in df_arr.columns:
+                    if _norm(c) == "enterprise id":
+                        df_arr = df_arr.rename(columns={c: "ENTERPRISE ID"})
+                        break
+            if "ENTERPRISE ID" in df_arr.columns:
+                df_arr = df_arr.merge(df_rooftops, on="ENTERPRISE ID", how="left")
+
+    # Optional: EnterpriseConfigs (ENTERPRISE ID, Configuration) and EnterpriseChurn (ENTERPRISE ID, Churn Propensity, Risk Category)
+    df_enterprise_configs: Optional[pd.DataFrame] = None
+    df_enterprise_churn: Optional[pd.DataFrame] = None
+    if all_sheets is not None:
+        if args.sheet_enterprise_configs in all_sheets:
+            _cfg = _normalize_columns(all_sheets[args.sheet_enterprise_configs].copy(), ("ENTERPRISE ID", "Configuration"))
+            if "ENTERPRISE ID" in _cfg.columns and "Configuration" in _cfg.columns:
+                df_enterprise_configs = _cfg[["ENTERPRISE ID", "Configuration"]].drop_duplicates(subset=["ENTERPRISE ID"], keep="first")
+        if args.sheet_enterprise_churn in all_sheets:
+            _churn = _normalize_columns(all_sheets[args.sheet_enterprise_churn].copy(), ("ENTERPRISE ID", "Churn Propensity", "Risk Category"))
+            if "ENTERPRISE ID" in _churn.columns and "Churn Propensity" in _churn.columns and "Risk Category" in _churn.columns:
+                df_enterprise_churn = _churn[["ENTERPRISE ID", "Churn Propensity", "Risk Category"]].drop_duplicates(subset=["ENTERPRISE ID"], keep="first")
 
     # (workflow_map already built from WorkflowMapping above when loading in-scope functions)
 
-    # Output two Excel files: one for Daily+Weekly scope, one for Daily+Weekly+Monthly scope
+    # Output one Excel file per scope: Daily, Daily+Weekly, Daily+Weekly+Monthly
     blend_runs = [("", 0.0)]
     out_base = Path(args.out).stem
-    if out_base.endswith("_DailyWeeklyMonthly"):
-        out_base = out_base.replace("_DailyWeeklyMonthly", "")
-    elif out_base.endswith("_DailyWeekly"):
-        out_base = out_base.replace("_DailyWeekly", "")
+    for suffix in ("_DailyWeeklyMonthly", "_DailyWeekly", "_Daily"):
+        if out_base.endswith(suffix):
+            out_base = out_base.replace(suffix, "")
+            break
     out_dir = Path(args.out).parent
     scope_configs = [
+        ("Daily", SCOPE_DAILY),
         ("DailyWeekly", SCOPE_DAILY_WEEKLY),
         ("DailyWeeklyMonthly", SCOPE_DAILY_WEEKLY_MONTHLY),
     ]
     saved_paths: List[Path] = []
     export_for_dashboard: Dict[str, dict] = {}
+
+    print(f"\n--- In-scope and greedy ---")
+    print(f"WorkflowMapping: {len(in_scope_functions)} functions. In-scope per scope = not yet modernized (No/Partial) and used by ≥1 customer at that scope.")
+
+    # Precompute ARR/eligible once for all scope runs (avoids 3x _prepare_enterprise_arr)
+    _, prepared_eligible, prepared_arr_map, prepared_rooftops_map = _prepare_enterprise_arr(
+        df_arr, args.arr_threshold, "ENTERPRISE ID", "ARR"
+    )
+    prepared_arr = (prepared_eligible, prepared_arr_map, prepared_rooftops_map)
+
+    # 1) In-scope = not yet modernized (Complete No/Partial) and used by ≥1 customer at scope (DW or DWM).
+    # 2) Greedy = optimal order of those functions to maximize rooftops unlocked.
+    # 3) Function Frequency Summary = raw data (all usage patterns) so you see how often functions are used.
+    function_frequency_df = build_function_frequency_summary(
+        df_function_mapping,
+        workflow_map,
+        completed_map=completed_map,
+        in_scope_functions=in_scope_functions,
+    )
 
     for scope_label, valid_patterns in scope_configs:
         df_scope = df_function_mapping[
@@ -991,7 +1360,23 @@ def main() -> int:
                 objective=args.objective,
                 blend_weight_customers=blend_weight,
                 valid_patterns=valid_patterns,
+                _prepared_arr=prepared_arr,
             )
+            n_in_scope = len(selected_functions)
+            print(f"  [Scope {scope_label}] In-scope: {n_in_scope} functions (not yet modernized and used by ≥1 customer at this scope)")
+            # Pull up same-workflow functions: if <3 other functions on same workflow remain later, move them right after this function
+            if not steps_df.empty and workflow_map:
+                ordered_functions = [
+                    f for f in
+                    steps_df[steps_df["step"] >= 1].sort_values("step")["function_to_modernize"].tolist()
+                    if f and str(f).strip()
+                ]
+                new_order = _reorder_sequence_with_workflow_pullup(ordered_functions, workflow_map, threshold=3)
+                if new_order != ordered_functions:
+                    steps_df, enterprise_unlock_df = _rebuild_steps_and_unlock_from_order(
+                        new_order, steps_df, enterprise_unlock_df
+                    )
+                    selected_functions = new_order
             tranche_summary_df = build_tranche_summary(enterprise_unlock_df)
             if not steps_df.empty:
                 full_steps = steps_df[["step", "function_to_modernize"]].drop_duplicates(subset=["step"], keep="first")
@@ -1009,32 +1394,66 @@ def main() -> int:
                     "step", "function_to_modernize", "customers_unlocked", "cumulative_customers_unlocked",
                     "rooftops_unlocked", "cumulative_rooftops_unlocked", "arr_unlocked", "cumulative_arr_unlocked",
                 ]]
-            tranche_summary_df["workflow"] = tranche_summary_df["function_to_modernize"].map(workflow_map).fillna("")
+            tranche_summary_df["workflow"] = tranche_summary_df["function_to_modernize"].astype(str).str.upper().map(workflow_map).fillna("")
+            # Add segment: 0 for step 0, else floor(cumulative_rooftops_unlocked / 1000) + 1
+            tranche_summary_df["segment"] = np.where(
+                tranche_summary_df["step"] == 0,
+                0,
+                (pd.to_numeric(tranche_summary_df["cumulative_rooftops_unlocked"], errors="coerce").fillna(0) // 1000).astype(int) + 1,
+            )
             tranche_summary_df = tranche_summary_df[[
-                "step", "function_to_modernize", "workflow", "customers_unlocked", "cumulative_customers_unlocked",
+                "step", "segment", "function_to_modernize", "workflow", "customers_unlocked", "cumulative_customers_unlocked",
                 "rooftops_unlocked", "cumulative_rooftops_unlocked", "arr_unlocked", "cumulative_arr_unlocked",
             ]]
             tranche_summary_df = _round_dollar_columns(tranche_summary_df)
 
             enterprise_unlock_view_df = build_enterprise_unlock_view(enterprise_unlock_df)
-            enterprise_unlock_view_df["workflow"] = enterprise_unlock_view_df["function_completed_in_step"].map(workflow_map).fillna("")
-            cols_ent = [c for c in enterprise_unlock_view_df.columns if c != "workflow"]
-            idx = cols_ent.index("function_completed_in_step") + 1 if "function_completed_in_step" in cols_ent else len(cols_ent)
-            cols_ent.insert(idx, "workflow")
+            step_to_segment = tranche_summary_df.drop_duplicates(subset=["step"], keep="first").set_index("step")["segment"]
+            enterprise_unlock_view_df["segment"] = enterprise_unlock_view_df["Step Unlocked"].map(step_to_segment)
+            enterprise_unlock_view_df["workflow"] = enterprise_unlock_view_df["function_completed_in_step"].astype(str).str.upper().map(workflow_map).fillna("")
+            if df_enterprise_configs is not None and not df_enterprise_configs.empty:
+                enterprise_unlock_view_df = enterprise_unlock_view_df.merge(df_enterprise_configs, on="ENTERPRISE ID", how="left")
+            if df_enterprise_churn is not None and not df_enterprise_churn.empty:
+                enterprise_unlock_view_df = enterprise_unlock_view_df.merge(df_enterprise_churn, on="ENTERPRISE ID", how="left")
+            # Column order: ID, Name, Rooftops, ARR, then optional Configuration / Churn Propensity / Risk Category, then Step Unlocked, segment, function_completed_in_step, workflow
+            cols_ent = ["ENTERPRISE ID", "Name", "Rooftops", "ARR"]
+            for c in ["Configuration", "Churn Propensity", "Risk Category"]:
+                if c in enterprise_unlock_view_df.columns:
+                    cols_ent.append(c)
+            cols_ent += ["Step Unlocked", "segment", "function_completed_in_step", "workflow"]
+            cols_ent = [c for c in cols_ent if c in enterprise_unlock_view_df.columns]
             enterprise_unlock_view_df = enterprise_unlock_view_df[cols_ent]
             enterprise_unlock_view_df = _round_dollar_columns(enterprise_unlock_view_df)
 
             sheets.append(("TrancheSummary", _format_sheet_columns(tranche_summary_df)))
+            segment_summary_df = build_segment_summary(tranche_summary_df, rooftop_segment_size=1000)
+            if not segment_summary_df.empty:
+                sheets.append(("SegmentSummary", segment_summary_df))
             sheets.append(("EnterpriseUnlockByStep", _format_sheet_columns(enterprise_unlock_view_df)))
 
+        # Matrix from full mapping so all frequencies are shown (daily, weekly, monthly, quarterly, etc.)
         matrix_df = build_enterprise_function_usage_matrix(
-            df_scope,
+            df_function_mapping,
             df_arr,
             workflow_map,
             completed_map=completed_map,
         )
+
+        # Function summary from raw data (first tab); add per-scope "In scope (used as step)"
+        if not function_frequency_df.empty:
+            scope_freq = function_frequency_df.copy()
+            selected_upper = {f.upper() for f in selected_functions}
+            scope_freq["In scope (used as step)"] = scope_freq["Function"].apply(
+                lambda f: "Yes" if (f.upper() in selected_upper) else "No"
+            )
+            cols = ["Function", "Workflow", "Complete", "In scope (used as step)"]
+            cols += [c for c in scope_freq.columns if c not in cols]
+            scope_freq = scope_freq[cols]
+            sheets.insert(0, ("FunctionFrequencySummary", _format_sheet_columns(scope_freq)))
+
+        # Matrix second in tab order; shows all frequencies
         if not matrix_df.empty:
-            sheets.append(("EnterpriseFunctionUsageMatrix", matrix_df))
+            sheets.insert(1, ("EnterpriseFunctionUsageMatrix", matrix_df))
 
         out_path = out_dir / f"{out_base}_{scope_label}.xlsx"
         with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
@@ -1049,22 +1468,26 @@ def main() -> int:
         print(f"Saved: {out_path} (sheets: {', '.join(s[0][:31] for s in sheets)})")
 
         if args.export_json is not None:
+            unlock_df = _format_sheet_columns(enterprise_unlock_view_df)
+            if args.dashboard_max_unlock_rows is not None:
+                unlock_df = unlock_df.head(args.dashboard_max_unlock_rows)
             export_for_dashboard[scope_label] = {
                 "enterpriseSummary": _dataframe_to_json_records(_format_sheet_columns(enterprise_summary_df)),
                 "trancheSummary": _dataframe_to_json_records(_format_sheet_columns(tranche_summary_df)),
-                "enterpriseUnlockByStep": _dataframe_to_json_records(_format_sheet_columns(enterprise_unlock_view_df)),
-                "workflowMap": workflow_map,
+                "enterpriseUnlockByStep": _dataframe_to_json_records(unlock_df),
+                # workflowMap stored only at top level to reduce file size
             }
 
     if args.export_json is not None and export_for_dashboard:
         out_json = Path(args.export_json)
         out_json.parent.mkdir(parents=True, exist_ok=True)
         payload = {"scopes": export_for_dashboard, "workflowMap": workflow_map}
+        indent = 2 if args.dashboard_pretty else None
         with open(out_json, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, default=str)
+            json.dump(payload, f, indent=indent, default=str)
         print(f"\nExported dashboard JSON: {out_json}")
 
-    print(f"\nOutputs: {saved_paths[0].name} (Daily+Weekly), {saved_paths[1].name} (Daily+Weekly+Monthly)")
+    print(f"\nOutputs: " + ", ".join(f"{p.name} ({s})" for p, s in zip(saved_paths, ["Daily", "Daily+Weekly", "Daily+Weekly+Monthly"])))
     return 0
 
 
