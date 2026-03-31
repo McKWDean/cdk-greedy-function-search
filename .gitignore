@@ -1,22 +1,32 @@
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
+*$py.class
 .Python
+.env
 .venv/
 venv/
-.env
 
-# Node / Next
-dashboard/node_modules/
-dashboard/.next/
-dashboard/out/
+# Local / sensitive inputs (do not commit)
+*.xlsx
+bobs_account_stuff/
+form_data/
+spooler_data/
+users_plus_profiles/
+3pa/
 
-# IDE / OS
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
+# Generated outputs & reports (repo root only — avoid matching segmentation/*.py)
+/acct_three_cohort_*
+/service_three_cohort_*
+/cluster_*.csv
+/customer_clusters*.csv
+/configuration_overlap_executive_summary.txt
+/configuration_overlap_report.csv
+/enterprise_configuration*.xlsx
+/deck_*.csv
+/feature_glossary*.csv
+/population_benchmarks*.csv
+/exact_setup_duplicate_groups.csv
+/charts/
 
-# Optional: uncomment to avoid committing the large JSON (use NEXT_PUBLIC_DATA_URL instead)
-# dashboard/public/data/result.json
+# Root-level CSV extracts (often customer-specific)
+*.csv
